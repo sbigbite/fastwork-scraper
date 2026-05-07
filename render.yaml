@@ -33,10 +33,5 @@ services:
         name: Cache-Control
         value: no-cache
     envVars:
-      # Render injects the backend's hostname (e.g. fastwork-scraper-api.onrender.com)
-      # into this build-time variable so the frontend bundle points at the right URL.
       - key: VITE_API_URL
-        fromService:
-          name: fastwork-scraper-api
-          type: web
-          property: host
+        value: https://fastwork-scraper-api.onrender.com
