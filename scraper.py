@@ -1,17 +1,14 @@
-import re
 import time
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://jobboard.fastwork.co"
-JOBS_URL = f"{BASE_URL}/jobs"
+JOBS_PAGE_URL = "https://jobboard.fastwork.co/jobs"
+API_URL       = "https://jobboard-api.fastwork.co/api/jobs"
 
 HEADERS = {
     "User-Agent": (
@@ -19,18 +16,17 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json",
     "Accept-Language": "th,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": BASE_URL,
+    "Referer": JOBS_PAGE_URL,
+    "Origin": "https://jobboard.fastwork.co",
 }
 
 # ---------------------------------------------------------------------------
 # Keyword definitions
 # ---------------------------------------------------------------------------
 
-# Each entry: (keyword, weight)  — weight 2 = high relevance, 1 = moderate
+# Each entry: (keyword, weight) — weight 2 = high relevance, 1 = moderate
 CIVIL_KEYWORDS: list[tuple[str, int]] = [
     # Core job-spec terms
     ("BOQ", 2),
@@ -64,7 +60,7 @@ CIVIL_KEYWORDS: list[tuple[str, int]] = [
     ("แบบก่อสร้าง", 2),
     ("permit", 1),
     ("ขออนุญาต", 1),
-    # Related software / tools
+    # Software / tools
     ("Revit", 2),
     ("SketchUp", 1),
     ("ArchiCAD", 1),
@@ -85,6 +81,14 @@ CIVIL_KEYWORDS: list[tuple[str, int]] = [
 
 MAX_POSSIBLE_SCORE = sum(w for _, w in CIVIL_KEYWORDS)
 
+# API returns a fixed 50 results per page; we cap all-pages scrapes here
+# to avoid hammering the server on free-tier deploys.
+MAX_PAGES = 80
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class JobListing:
@@ -93,6 +97,8 @@ class JobListing:
     budget: str
     posted_time: str
     job_url: str
+    category: str = ""
+    job_type: str = ""
     match_score: int = 0
     match_percentage: float = 0.0
     matched_keywords: list[str] = field(default_factory=list)
@@ -104,187 +110,46 @@ class JobListing:
 
 
 # ---------------------------------------------------------------------------
-# Keyword matching
+# Helpers
 # ---------------------------------------------------------------------------
 
+def _format_budget(raw) -> str:
+    """Convert raw budget value (e.g. '15001') to '฿15,001'."""
+    if not raw:
+        return "ไม่ระบุ"
+    try:
+        return f"฿{int(raw):,}"
+    except (ValueError, TypeError):
+        return str(raw)
+
+
 def compute_match(title: str, description: str) -> tuple[int, float, list[str]]:
-    """Return (raw_score, percentage, list_of_matched_keywords)."""
+    """Return (raw_score, percentage, matched_keyword_list)."""
     text = f"{title} {description}".lower()
     score = 0
     matched: list[str] = []
-
     for kw, weight in CIVIL_KEYWORDS:
         if kw.lower() in text:
             score += weight
             matched.append(kw)
-
     pct = min((score / MAX_POSSIBLE_SCORE) * 100, 100.0)
     return score, pct, matched
 
 
 # ---------------------------------------------------------------------------
-# HTML parsing helpers  (handles multiple possible page layouts)
+# API mapping
 # ---------------------------------------------------------------------------
-
-def _safe_text(tag, default: str = "") -> str:
-    return tag.get_text(strip=True) if tag else default
-
-
-def _parse_job_cards(soup: BeautifulSoup) -> list[JobListing]:
-    """
-    Try several known Fastwork card selectors.
-    Returns a list of JobListing objects (unfiltered).
-    """
-    jobs: list[JobListing] = []
-
-    # Attempt 1: data-testid or class patterns seen on Fastwork job board
-    card_selectors = [
-        "div[data-testid='job-card']",
-        "div.job-card",
-        "div.JobCard",
-        "article.job-item",
-        "li.job-item",
-        "div[class*='JobList'] div[class*='Card']",
-        "a[href*='/jobs/']",          # fallback: anchor links
-    ]
-
-    cards = []
-    for sel in card_selectors:
-        cards = soup.select(sel)
-        if cards:
-            logger.info("Found %d cards with selector: %s", len(cards), sel)
-            break
-
-    if not cards:
-        logger.warning("No job cards found with known selectors.")
-        return jobs
-
-    for card in cards:
-        # --- Title ---
-        title_tag = (
-            card.select_one("h2")
-            or card.select_one("h3")
-            or card.select_one("[class*='title' i]")
-            or card.select_one("[class*='Title' ]")
-            or card.select_one("strong")
-        )
-        title = _safe_text(title_tag, "Unknown")
-
-        # --- Description ---
-        desc_tag = (
-            card.select_one("[class*='description' i]")
-            or card.select_one("[class*='desc' i]")
-            or card.select_one("p")
-        )
-        description = _safe_text(desc_tag)
-
-        # --- Budget ---
-        budget_tag = (
-            card.select_one("[class*='budget' i]")
-            or card.select_one("[class*='price' i]")
-            or card.select_one("[class*='salary' i]")
-            or card.select_one("[class*='rate' i]")
-        )
-        budget = _safe_text(budget_tag, "ไม่ระบุ")
-
-        # --- Posted time ---
-        time_tag = (
-            card.select_one("time")
-            or card.select_one("[class*='time' i]")
-            or card.select_one("[class*='date' i]")
-            or card.select_one("[datetime]")
-        )
-        posted_time = (
-            time_tag.get("datetime") or _safe_text(time_tag)
-            if time_tag else "ไม่ระบุ"
-        )
-
-        # --- URL ---
-        link_tag = card.select_one("a[href]") if card.name != "a" else card
-        href = link_tag.get("href", "") if link_tag else ""
-        job_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-
-        score, pct, matched = compute_match(title, description)
-
-        jobs.append(
-            JobListing(
-                title=title,
-                description=description,
-                budget=budget,
-                posted_time=posted_time,
-                job_url=job_url,
-                match_score=score,
-                match_percentage=pct,
-                matched_keywords=matched,
-            )
-        )
-
-    return jobs
-
-
-# ---------------------------------------------------------------------------
-# API endpoint probing  (Fastwork may expose a JSON API)
-# ---------------------------------------------------------------------------
-
-API_ENDPOINTS = [
-    f"{BASE_URL}/api/v1/jobs",
-    f"{BASE_URL}/api/v2/jobs",
-    "https://api.fastwork.co/jobs",
-    "https://jobboard.fastwork.co/api/jobs",
-]
-
-
-def _try_api_fetch(session: requests.Session, params: dict) -> Optional[list[dict]]:
-    """Probe known API patterns; return raw job list if found, else None."""
-    for url in API_ENDPOINTS:
-        try:
-            r = session.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                # Common shapes: {"data": [...]} or {"jobs": [...]} or [...]
-                if isinstance(data, list):
-                    logger.info("API hit (list) at %s", url)
-                    return data
-                if isinstance(data, dict):
-                    for key in ("data", "jobs", "items", "results"):
-                        if key in data and isinstance(data[key], list):
-                            logger.info("API hit (dict.%s) at %s", key, url)
-                            return data[key]
-        except Exception:
-            continue
-    return None
-
 
 def _map_api_job(raw: dict) -> JobListing:
-    """Convert a raw API job dict to a JobListing."""
-    title = raw.get("title") or raw.get("name") or raw.get("job_title") or "Unknown"
-    description = (
-        raw.get("description")
-        or raw.get("detail")
-        or raw.get("body")
-        or raw.get("excerpt")
-        or ""
-    )
-    budget = str(
-        raw.get("budget")
-        or raw.get("price")
-        or raw.get("salary")
-        or raw.get("rate")
-        or "ไม่ระบุ"
-    )
-    posted_time = str(
-        raw.get("created_at")
-        or raw.get("posted_at")
-        or raw.get("published_at")
-        or raw.get("date")
-        or "ไม่ระบุ"
-    )
-    slug = raw.get("slug") or raw.get("id") or ""
-    job_url = (
-        raw.get("url")
-        or raw.get("link")
-        or (f"{BASE_URL}/jobs/{slug}" if slug else "")
-    )
+    """Map one item from the Fastwork /api/jobs response to a JobListing."""
+    job_id    = raw.get("id", "")
+    title     = raw.get("title") or "Unknown"
+    description = raw.get("description") or ""
+    budget    = _format_budget(raw.get("budget"))
+    posted_time = raw.get("inserted_at") or raw.get("updated_at") or "ไม่ระบุ"
+    job_url   = f"{JOBS_PAGE_URL}/{job_id}" if job_id else ""
+    category  = (raw.get("tag") or {}).get("name", "")
+    job_type  = raw.get("type", "")
 
     score, pct, matched = compute_match(title, description)
 
@@ -294,6 +159,8 @@ def _map_api_job(raw: dict) -> JobListing:
         budget=budget,
         posted_time=posted_time,
         job_url=job_url,
+        category=category,
+        job_type=job_type,
         match_score=score,
         match_percentage=pct,
         matched_keywords=matched,
@@ -301,69 +168,102 @@ def _map_api_job(raw: dict) -> JobListing:
 
 
 # ---------------------------------------------------------------------------
-# Public scrape function
+# Fetch helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_page(session: requests.Session, page: int, tag_id: str = "") -> tuple[list[JobListing], dict]:
+    """Fetch a single page from the API. Returns (jobs, meta)."""
+    params: dict = {"page": page}
+    if tag_id:
+        params["tag_id"] = tag_id
+
+    resp = session.get(API_URL, params=params, timeout=15)
+    resp.raise_for_status()
+
+    data = resp.json()
+    jobs = [_map_api_job(j) for j in data.get("data", [])]
+    meta = data.get("meta", {})
+    return jobs, meta
+
+
+def _fetch_all_pages(
+    session: requests.Session,
+    tag_id: str = "",
+    request_delay: float = 0.5,
+) -> tuple[list[JobListing], dict]:
+    """Fetch every page and return combined job list plus the last meta."""
+    all_jobs: list[JobListing] = []
+    meta: dict = {}
+    page = 1
+
+    while True:
+        logger.info("Fetching page %d …", page)
+        jobs, meta = _fetch_page(session, page, tag_id)
+        all_jobs.extend(jobs)
+
+        total_pages = meta.get("total_pages", 1)
+        logger.info("  page %d/%d — %d jobs so far", page, total_pages, len(all_jobs))
+
+        if page >= total_pages or page >= MAX_PAGES:
+            break
+
+        page += 1
+        time.sleep(request_delay)
+
+    return all_jobs, meta
+
+
+# ---------------------------------------------------------------------------
+# Public API
 # ---------------------------------------------------------------------------
 
 def scrape_jobs(
     min_match_pct: float = 0.0,
     page: int = 1,
-    per_page: int = 50,
-    category: str = "",
+    all_pages: bool = False,
+    tag_id: str = "",
 ) -> dict:
     """
-    Scrape Fastwork job listings.
+    Fetch Fastwork job listings from the official API.
 
-    Returns:
+    Args:
+        min_match_pct: Only return jobs at or above this match %.
+        page:          Which page to fetch (ignored when all_pages=True).
+        all_pages:     Fetch every page (up to MAX_PAGES). Slow — use wisely.
+        tag_id:        Optional Fastwork category UUID to filter by.
+
+    Returns a dict:
         {
-            "jobs": [ {...}, ... ],
-            "total": int,
-            "source": "api" | "html",
-            "page": int,
-            "per_page": int,
+            "jobs":            [{...}, ...],
+            "total":           <filtered count>,
+            "total_available": <total on Fastwork>,
+            "total_pages":     <pages on Fastwork>,
+            "current_page":    <page fetched>,
+            "source":          "api",
         }
     """
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    params = {"page": page, "per_page": per_page}
-    if category:
-        params["category"] = category
+    try:
+        if all_pages:
+            all_jobs, meta = _fetch_all_pages(session, tag_id)
+        else:
+            all_jobs, meta = _fetch_page(session, page, tag_id)
+    except requests.RequestException as e:
+        logger.error("API request failed: %s", e)
+        raise
 
-    # --- Try JSON API first ---
-    raw_jobs = _try_api_fetch(session, params)
-    source = "api"
-
-    if raw_jobs is not None:
-        all_jobs = [_map_api_job(j) for j in raw_jobs]
-    else:
-        # --- Fallback: HTML scraping ---
-        source = "html"
-        logger.info("API not found; falling back to HTML scraping: %s", JOBS_URL)
-        try:
-            resp = session.get(JOBS_URL, params=params, timeout=15)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.error("HTTP request failed: %s", e)
-            raise
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        all_jobs = _parse_job_cards(soup)
-
-        if not all_jobs:
-            # Last resort: dump raw text for debugging
-            logger.warning("HTML parse found no jobs. Page title: %s", soup.title)
-
-    # Filter by match percentage
     if min_match_pct > 0:
         all_jobs = [j for j in all_jobs if j.match_percentage >= min_match_pct]
 
-    # Sort by match percentage descending
     all_jobs.sort(key=lambda j: j.match_percentage, reverse=True)
 
     return {
-        "jobs": [j.to_dict() for j in all_jobs],
-        "total": len(all_jobs),
-        "source": source,
-        "page": page,
-        "per_page": per_page,
+        "jobs":            [j.to_dict() for j in all_jobs],
+        "total":           len(all_jobs),
+        "total_available": meta.get("total_count", 0),
+        "total_pages":     meta.get("total_pages", 1),
+        "current_page":    meta.get("current_page", page),
+        "source":          "api",
     }
