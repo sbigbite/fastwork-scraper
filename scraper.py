@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 
 JOBS_PAGE_URL = "https://jobboard.fastwork.co/jobs"
 API_URL       = "https://jobboard-api.fastwork.co/api/jobs"
-TAGS_URL      = "https://jobboard-api.fastwork.co/api/tags"
 
 HEADERS = {
     "User-Agent": (
@@ -23,26 +22,7 @@ HEADERS = {
     "Origin": "https://jobboard.fastwork.co",
 }
 
-# ---------------------------------------------------------------------------
-# Civil-engineering categories (from GET /api/tags)
-#
-# The Fastwork API does NOT honour tag_id as a server-side filter —
-# every variant we probed (tag_id, tag_ids, tag_ids[], tag, category_id,
-# category, comma-separated) returned all 3 976 jobs unchanged.
-# We therefore apply tag filtering client-side immediately after each page
-# is fetched, discarding ~94 % of irrelevant jobs before keyword matching.
-# ---------------------------------------------------------------------------
-
-CIVIL_TAGS: dict[str, str] = {
-    # id -> Thai name
-    "883a6909-c772-48fa-91e9-b8162e599aba": "ช่าง",                              # trades / construction
-    "d19619b6-a04a-4c26-b74b-dbfe28494a9b": "สถาปัตยกรรมและการตกแต่งภายใน",    # architecture & interior
-}
-
-# Catch-all tag — include when the caller wants broader coverage
-CATCHALL_TAG_ID = "b561a88b-03e5-4f03-8a6d-ba169671797d"  # อื่นๆ
-
-MAX_PAGES = 80  # API has ~80 pages; cap to avoid runaway requests on free tier
+MAX_PAGES = 80  # hard cap — API has ~80 pages total
 
 
 # ---------------------------------------------------------------------------
@@ -119,14 +99,6 @@ def compute_match(title: str, description: str) -> tuple[int, float, list[str]]:
     return score, pct, matched
 
 
-def _is_civil_tag(tag_id: str, include_catchall: bool = False) -> bool:
-    if tag_id in CIVIL_TAGS:
-        return True
-    if include_catchall and tag_id == CATCHALL_TAG_ID:
-        return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # API mapping
 # ---------------------------------------------------------------------------
@@ -155,75 +127,40 @@ def _map_api_job(raw: dict) -> JobListing:
 # Fetch helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_page(
-    session: requests.Session,
-    page: int,
-    filter_by_tags: bool = True,
-    include_catchall: bool = False,
-) -> tuple[list[JobListing], dict, int]:
-    """
-    Fetch one page from the API.
-
-    Returns (jobs, meta, raw_count) where raw_count is the number of jobs
-    returned by the API before any tag filtering.
-    """
+def _fetch_page(session: requests.Session, page: int) -> tuple[list[JobListing], dict]:
+    """Fetch one page from the API. Returns (jobs, meta)."""
     resp = session.get(API_URL, params={"page": page}, timeout=15)
     resp.raise_for_status()
-
-    data     = resp.json()
-    raw_data = data.get("data", [])
-    meta     = data.get("meta", {})
-    raw_count = len(raw_data)
-
-    if filter_by_tags:
-        raw_data = [
-            j for j in raw_data
-            if _is_civil_tag((j.get("tag") or {}).get("id", ""), include_catchall)
-        ]
-        logger.debug(
-            "page %d: %d → %d after tag filter",
-            page, raw_count, len(raw_data),
-        )
-
-    jobs = [_map_api_job(j) for j in raw_data]
-    return jobs, meta, raw_count
+    data = resp.json()
+    jobs = [_map_api_job(j) for j in data.get("data", [])]
+    return jobs, data.get("meta", {})
 
 
-def _fetch_all_pages(
+def _fetch_pages(
     session: requests.Session,
-    filter_by_tags: bool = True,
-    include_catchall: bool = False,
+    pages: int = 5,
     request_delay: float = 0.5,
-) -> tuple[list[JobListing], dict, int]:
+) -> tuple[list[JobListing], dict]:
     """
-    Iterate every page and return (combined_jobs, last_meta, total_fetched).
-    total_fetched counts API jobs before tag filtering.
+    Fetch up to `pages` pages (starting from page 1) and return
+    (combined_jobs, last_meta).  Stops early if the API has fewer pages.
     """
     all_jobs: list[JobListing] = []
     meta: dict = {}
-    total_fetched = 0
-    page = 1
+    num_pages = min(pages, MAX_PAGES)
 
-    while True:
-        jobs, meta, raw_count = _fetch_page(
-            session, page, filter_by_tags, include_catchall
-        )
+    for page in range(1, num_pages + 1):
+        jobs, meta = _fetch_page(session, page)
         all_jobs.extend(jobs)
-        total_fetched += raw_count
+        logger.info("page %d/%d — %d jobs fetched so far", page, num_pages, len(all_jobs))
 
-        total_pages = meta.get("total_pages", 1)
-        logger.info(
-            "page %d/%d — %d civil jobs kept (fetched %d total so far)",
-            page, total_pages, len(all_jobs), total_fetched,
-        )
+        if page >= meta.get("total_pages", 1):
+            break  # reached the last page the API has
 
-        if page >= total_pages or page >= MAX_PAGES:
-            break
+        if page < num_pages:
+            time.sleep(request_delay)
 
-        page += 1
-        time.sleep(request_delay)
-
-    return all_jobs, meta, total_fetched
+    return all_jobs, meta
 
 
 # ---------------------------------------------------------------------------
@@ -232,51 +169,34 @@ def _fetch_all_pages(
 
 def scrape_jobs(
     min_match_pct: float = 0.0,
-    page: int = 1,
-    all_pages: bool = False,
-    filter_by_tags: bool = True,
-    include_catchall: bool = False,
+    pages: int = 5,
 ) -> dict:
     """
-    Fetch Fastwork job listings, pre-filtered to civil engineering categories.
+    Fetch Fastwork job listings across `pages` pages and rank by keyword match.
 
-    The Fastwork API does not support server-side tag filtering, so we apply
-    it client-side after each page fetch:
-      1. Fetch page from API (50 jobs)
-      2. Discard jobs whose tag is not in CIVIL_TAGS  [~94 % discarded]
-      3. Run keyword matching on the remaining jobs
+    All jobs from all categories are fetched; keyword matching alone determines
+    civil engineering relevance.
 
     Args:
-        min_match_pct:    Only return jobs at or above this match %.
-        page:             Page to fetch (ignored when all_pages=True).
-        all_pages:        Fetch and filter every page (up to MAX_PAGES).
-        filter_by_tags:   Apply civil category pre-filter (default True).
-        include_catchall: Also keep jobs tagged อื่นๆ (broader, noisier).
+        min_match_pct: Only return jobs at or above this match % (default 0).
+        pages:         How many pages to fetch (default 5 = 250 jobs).
+                       Pass 80 to fetch everything.
 
     Returns:
         {
-            "jobs":              [{...}, ...],
-            "total":             <count after all filters>,
-            "total_available":   <total jobs on Fastwork before any filter>,
-            "total_pages":       <total pages on Fastwork>,
-            "current_page":      <page fetched>,
-            "source":            "api",
-            "civil_tags":        {id: name, ...},
-            "filter_by_tags":    bool,
+            "jobs":            [{...}, ...],   sorted by match_percentage desc
+            "total":           <count after min_match filter>,
+            "total_available": <total jobs on Fastwork>,
+            "total_pages":     <total pages on Fastwork>,
+            "pages_fetched":   <pages actually fetched>,
+            "source":          "api",
         }
     """
     session = requests.Session()
     session.headers.update(HEADERS)
 
     try:
-        if all_pages:
-            all_jobs, meta, fetched = _fetch_all_pages(
-                session, filter_by_tags, include_catchall
-            )
-        else:
-            all_jobs, meta, fetched = _fetch_page(
-                session, page, filter_by_tags, include_catchall
-            )
+        all_jobs, meta = _fetch_pages(session, pages)
     except requests.RequestException as e:
         logger.error("API request failed: %s", e)
         raise
@@ -286,17 +206,11 @@ def scrape_jobs(
 
     all_jobs.sort(key=lambda j: j.match_percentage, reverse=True)
 
-    active_tags = dict(CIVIL_TAGS)
-    if include_catchall:
-        active_tags[CATCHALL_TAG_ID] = "อื่นๆ"
-
     return {
         "jobs":            [j.to_dict() for j in all_jobs],
         "total":           len(all_jobs),
         "total_available": meta.get("total_count", 0),
         "total_pages":     meta.get("total_pages", 1),
-        "current_page":    meta.get("current_page", page),
+        "pages_fetched":   min(pages, meta.get("total_pages", pages), MAX_PAGES),
         "source":          "api",
-        "filter_by_tags":  filter_by_tags,
-        "civil_tags":      active_tags,
     }

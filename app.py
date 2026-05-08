@@ -1,7 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from scraper import scrape_jobs, CIVIL_KEYWORDS, CIVIL_TAGS
+from scraper import scrape_jobs, CIVIL_KEYWORDS, MAX_PAGES
 
 app = Flask(__name__)
 CORS(app)
@@ -19,41 +19,23 @@ def get_keywords():
     })
 
 
-@app.route("/api/tags", methods=["GET"])
-def get_civil_tags():
-    """Return the civil engineering tag IDs used for pre-filtering."""
-    return jsonify({"civil_tags": CIVIL_TAGS})
-
-
 @app.route("/api/jobs", methods=["GET"])
 def get_jobs():
     """
     GET /api/jobs
 
     Query params:
-        min_match        float   Minimum match % to include (default 0)
-        page             int     Page number (default 1, ignored if all_pages=true)
-        all_pages        bool    Fetch all pages — slow, use sparingly (default false)
-        filter_by_tags   bool    Pre-filter to civil engineering categories (default true)
-        include_catchall bool    Also include jobs tagged อื่นๆ (default false)
+        min_match  float  Minimum match % to include (default 0)
+        pages      int    Number of pages to fetch, 1–80 (default 5 = 250 jobs)
     """
     try:
-        min_match        = float(request.args.get("min_match", 0))
-        page             = max(1, int(request.args.get("page", 1)))
-        all_pages        = request.args.get("all_pages", "false").lower() == "true"
-        filter_by_tags   = request.args.get("filter_by_tags", "true").lower() == "true"
-        include_catchall = request.args.get("include_catchall", "false").lower() == "true"
+        min_match = float(request.args.get("min_match", 0))
+        pages     = max(1, min(int(request.args.get("pages", 5)), MAX_PAGES))
     except (ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid query parameter: {e}"}), 400
 
     try:
-        result = scrape_jobs(
-            min_match_pct=min_match,
-            page=page,
-            all_pages=all_pages,
-            filter_by_tags=filter_by_tags,
-            include_catchall=include_catchall,
-        )
+        result = scrape_jobs(min_match_pct=min_match, pages=pages)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -62,23 +44,16 @@ def get_jobs():
 @app.route("/api/jobs/civil", methods=["GET"])
 def get_civil_jobs():
     """
-    Convenience endpoint — civil tag filter on, only matched jobs returned.
+    Convenience endpoint — only returns jobs with at least one keyword match,
+    sorted by relevance.
     """
     try:
-        page             = max(1, int(request.args.get("page", 1)))
-        all_pages        = request.args.get("all_pages", "false").lower() == "true"
-        include_catchall = request.args.get("include_catchall", "false").lower() == "true"
+        pages = max(1, min(int(request.args.get("pages", 5)), MAX_PAGES))
     except (ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid query parameter: {e}"}), 400
 
     try:
-        result = scrape_jobs(
-            min_match_pct=1.0,
-            page=page,
-            all_pages=all_pages,
-            filter_by_tags=True,
-            include_catchall=include_catchall,
-        )
+        result = scrape_jobs(min_match_pct=1.0, pages=pages)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
